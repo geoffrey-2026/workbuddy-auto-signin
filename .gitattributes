@@ -1,0 +1,33 @@
+# ── 行尾统一（2026-09-18 补）────────────────────────────────────────────
+#
+# 本机 system 级 core.autocrlf=true（Git for Windows 默认），而本仓库此前无
+# .gitattributes，于是继承了它，导致「行尾字节漂移」：
+#   git 把 CRLF 归一成 LF 存 blob，checkout 时又写回 CRLF
+#   ⇒ 磁盘字节 ≠ blob 字节，而 `git status` 仍报 clean（比对前做了归一）
+#   ⇒ 差异被**隐藏**；一切以 sha256 为准的核对会随 checkout 机器漂移 ⇒ 假告警。
+#
+# 修法：`eol=lf` 属性**优先于** core.autocrlf，使 sha256(磁盘) == sha256(blob)
+#       恒成立，且与 checkout 机器的 autocrlf 取值无关（参数随仓库走）。
+#
+# 配套动作（缺一不可）：加完本文件后必须把**工作区**已有文件也规整为 LF；
+# 只加属性不规整工作区 = 等于没修（git 仍会因为归一而报 clean，字节差异继续隐藏）。
+* text=auto eol=lf
+
+# ── 二进制：显式禁止任何转换（text=auto 的自动探测对少数格式不保险）──
+*.png   -text
+*.jpg   -text
+*.jpeg  -text
+*.gif   -text
+*.ico   -text
+*.zip   -text
+*.gz    -text
+*.7z    -text
+*.pdf   -text
+*.mp4   -text
+*.mp3   -text
+*.wav   -text
+*.pyc   -text
+*.exe   -text
+*.dll   -text
+*.so    -text
+*.dylib -text
