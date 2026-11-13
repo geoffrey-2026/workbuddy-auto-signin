@@ -84,7 +84,10 @@ def _emit(payload, as_json=False, log_path=""):
     """
     if as_json:
         line = json.dumps(payload, ensure_ascii=False, default=str)
-        print(line)
+        try:
+            print(line)
+        except Exception:
+            pass      # pythonw 无控制台时 stdout 不可用，不算错（--log 那条路还在）
     if log_path:
         try:
             d = os.path.dirname(os.path.abspath(log_path))
@@ -234,6 +237,16 @@ USAGE = __doc__
 
 
 def main(argv=None):
+    # ★★ 必须放在最前面：计划任务用 pythonw.exe 跑（无控制台），此时
+    #   sys.stdout / sys.stderr 是 None，任何 print 都会 AttributeError。
+    #   而那个异常会掉进下面的兜底分支、再去 _emit、再炸一次 —— 结果就是
+    #   「任务结果是 0、日志里一个字都没有」，当天到底领没领永远查不出来。
+    #   ⇒ 直接换成丢弃流，让所有 print 变成安全空操作。
+    if sys.stdout is None:
+        sys.stdout = io.StringIO()
+    if sys.stderr is None:
+        sys.stderr = io.StringIO()
+
     args = _parse(list(sys.argv[1:] if argv is None else argv))
     cmd = (args.cmd or "").strip().lower()
     if cmd in ("", "-h", "--help", "help"):

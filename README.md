@@ -149,10 +149,31 @@ py signin_hub.py doctor               # 离线体检（不联网、不启动外�
 
 ### 和定时任务怎么配
 
-- **要零 token、不依赖 WorkBuddy 在跑** ⇒ 用系统计划任务（`install-windows.ps1` 那套）跑
-  `signin_hub.py run all --json --log logs/hub.log`；
-- **想在 WorkBuddy 里收到人话汇报** ⇒ 让 AI 自动化只跑这一条命令，再把输出念给你。
-  站点逻辑不要写进 prompt —— prompt 里写业务逻辑等于再造一份正本。
+> [!IMPORTANT]
+> **只走系统计划任务（Windows 任务计划程序 / macOS launchd），不要挂到 AI 自动化上。**
+> 签到是**固定动作**：一条命令就能跑完，用计划任务是 **0 token**、开机即触发、不看
+> WorkBuddy 是否在线。挂到 AI 自动化 = 每天唤醒一个 agent 只为敲一条 20 行的命令，
+> 又慢又贵，出错还得靠它转述（多一层失真）。
+> AI 自动化留给「需要判断或有话要说」的活（写报告、查资料、欠账摘要）。
+
+本机（Windows）实际配置：
+
+| 任务名 | 触发 | 命令 |
+|---|---|---|
+| `WorkBuddyAutoSignin` | 每天 00:05 | `pythonw.exe signin_hub.py run all --json --log logs\hub.log` |
+| `WorkBuddyGrowthPoll` | 每天 01/05/09/13/17/21 | `pythonw.exe signin.py silent-poll`（成长中心轮询，不变） |
+
+★ 用 `pythonw.exe` 跑时 `sys.stdout` 是 `None`，所以 **`--log` 不是可选项**：
+结果只有落在 `logs/hub.log` 里，第二天才查得出来昨天到底领没领。
+（`signin_hub.py` 的 `main()` 已处理 `stdout is None`，并有测试守着。）
+
+验收别只看退出码：
+
+```powershell
+Start-ScheduledTask -TaskName WorkBuddyAutoSignin
+Get-ScheduledTaskInfo -TaskName WorkBuddyAutoSignin | Select-Object LastTaskResult, LastRunTime
+tail logs/hub.log      # ← 这一行 JSON 才是"到底领没领"
+```
 
 ---
 

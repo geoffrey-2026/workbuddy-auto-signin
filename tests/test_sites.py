@@ -224,6 +224,19 @@ class TestHubCli(unittest.TestCase):
     def test_list_runs(self):
         self.assertEqual(signin_hub.main(["list", "--json"]), 0)
 
+    def test_survives_pythonw_where_stdout_is_none(self):
+        """计划任务用 pythonw.exe 跑 ⇒ sys.stdout is None，print 会 AttributeError。
+
+        ★ 这是真踩过的形态：任务结果报 0、日志里一个字都没有 —— 因为唯一那个
+          print 先炸、兜底分支再炸，两次都在写同样的不可用 stdout。
+        """
+        old = sys.stdout
+        try:
+            sys.stdout = None
+            self.assertEqual(signin_hub.main(["list", "--json"]), 0)
+        finally:
+            sys.stdout = old
+
 
 class TestSingleSourceOfTruth(unittest.TestCase):
     def test_legacy_script_is_a_thin_shim(self):
