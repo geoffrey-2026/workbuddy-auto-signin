@@ -76,8 +76,83 @@
 | ⏰ | **双定时模式** —— AI 自动化（跨平台）或系统级静默（Win / macOS，零 token） |
 | 📣 | **智能汇报** —— 一行 JSON，如 `成功领取 100 积分（连续 7 天，累计 700 积分）` |
 | 💪 | **健壮** —— 兼容明文与受支持的加密凭据，区分格式错误、认证拒绝、权限限制及非签到季 |
+| 🧩 | **签到台** —— 一个入口管所有「每天要领一下」的事（WorkBuddy / 豆包 / 以后任何站点），一条命令全跑完、一份汇总；新增站点 = 一个模块 + 一行注册 |
 | 🌍 | **跨平台** —— 自动探测 Windows / macOS / Linux 凭据文件 |
 | 🔐 | **无密钥** —— 仓库不含任何密钥，只读取运行者本机登录凭据 |
+
+---
+
+## 🧩 签到台（多站点）
+
+签到这件事很容易散成一地：WorkBuddy 一个脚本、豆包一个脚本、某个游戏又一个……
+每来一个就多一条计划任务、多一个日志位置、多一种"成功"的定义。出问题时人得挨个翻，
+还分不清「今天没领到」和「领失败了」。
+
+`signin_hub.py` 把它收成一个台子：**一个列表、一次运行、一份汇总**。
+每个站点只管"怎么领"，领完统一折成同一张表。
+
+### 用法
+
+```bash
+py signin_hub.py list                 # 有哪些站点、各自要什么前置条件
+py signin_hub.py run all              # ★ 日常就这一条
+py signin_hub.py run doubao           # 只跑一个
+py signin_hub.py run all --dry-run    # 只看状态，不点、不领
+py signin_hub.py run all --skip doubao
+py signin_hub.py run all --json --log logs/hub.log   # 给自动化/无窗口运行用
+py signin_hub.py doctor               # 离线体检（不联网、不启动外部程序）
+```
+
+退出码：`0` 全部成功（含"早已领过"）／`1` 部分失败／`2` 全失败或用法错。
+
+> [!IMPORTANT]
+> **「早已领过」算成功。** 把它当失败，汇总就会每天报红，人很快开始无视告警——
+> 那比不监控更糟。这条在 `sites/base.py` 里是用代码钉死的（`ALREADY ∈ OK_STATES`），
+> 并有测试守着。
+
+### 已注册站点
+
+| 站点 | 做什么 | 前置条件 | 依赖 |
+|---|---|---|---|
+| `workbuddy` | WorkBuddy 每日积分 + 成长中心 | 本机已登录 WorkBuddy 桌面端 | 无（标准库） |
+| `doubao` | 豆包每日 200 免费额度（周一翻倍） | 已安装并登录「豆包电脑版」 | `playwright` |
+
+`workbuddy` 站点是**子进程**转调既有的 `signin.py`（不 import、不改它）——
+它崩溃只死一个子进程，其他站点照跑；上游更新时直接覆盖 `signin.py` 即可。
+
+`doubao` 站点通过 CDP（`127.0.0.1:9222`）连豆包桌面版；没开就自动带调试端口拉起它。
+活动入口只在**电脑版**（左侧栏左下角头像 → 免费用豆包），网页版与手机 App 没有。
+页面上还有 7 项任务各 +100 额度，那些需要人工做，不在本工具范围内。
+
+### 新增一个站点（三件事）
+
+1. 在 `sites/` 下写一个模块，提供 `run(dry_run=False) -> dict`，并给出 `SITE` / `TITLE` / `NEEDS` 三个常量；
+2. 在 `sites/__init__.py` 的 `_REGISTRY` 里加一行，需要时把 id 加进 `ORDER`；
+3. 给 `tests/test_sites.py` 补两条断言（至少一条"早已领过算成功"的负对照）。
+
+返回契约（`sites/base.py` 里有完整说明）：
+
+```python
+{
+  "site": "doubao", "ok": True,
+  "state": "claimed",        # claimed / already / skipped / failed / error
+  "report": "新领到 +200（累计 4300 → 4500）",
+  "detail": "诊断原文（排错用）",
+  "evidence": ["…/claim-20261113-091204.png"],
+  "exit": 0, "needs_attention": False,
+}
+```
+
+> [!WARNING]
+> provider **不许**把异常抛给上层。上层兜住只剩 traceback，没有上下文；
+> 宁可自己 `try` 完再返回 `state=failed` 并写清原因（参照 `sites/doubao.py`）。
+
+### 和定时任务怎么配
+
+- **要零 token、不依赖 WorkBuddy 在跑** ⇒ 用系统计划任务（`install-windows.ps1` 那套）跑
+  `signin_hub.py run all --json --log logs/hub.log`；
+- **想在 WorkBuddy 里收到人话汇报** ⇒ 让 AI 自动化只跑这一条命令，再把输出念给你。
+  站点逻辑不要写进 prompt —— prompt 里写业务逻辑等于再造一份正本。
 
 ---
 

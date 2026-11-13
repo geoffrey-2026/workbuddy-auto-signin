@@ -6,3 +6,7 @@ __pycache__/
 # WorkBuddy local workspace data (contains credentials / memory / automation config)
 .workbuddy/
 signin.log
+
+# 签到台运行产物（日志 / 截图 / 各站点证据）。★ 不含任何密钥，但也没必要入库：
+# 每次运行都会长，历史价值靠 claim-log.tsv（在 logs/<站点>/ 下）已经给了。
+logs/
