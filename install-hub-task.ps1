@@ -17,6 +17,14 @@
   ----
       powershell -ExecutionPolicy Bypass -File install-hub-task.ps1
       powershell -ExecutionPolicy Bypass -File install-hub-task.ps1 -Time 00:05 -DryRun
+      powershell -ExecutionPolicy Bypass -File install-hub-task.ps1 -NoRetry
+
+  ★ 2026-11-16 追加：**按需补跑**任务（`<TaskName>Retry`，默认 12:30）
+    原因：主任务每天只有 00:05 一次机会。11-16 那天豆包因为「页面还停在骨架屏」
+    失败，白天就再没补上，白丢 200 额度。
+    补跑动作是 `signin_hub.py retry` —— **只在今天确有 failed 时才真跑**；
+    全成时它只读一行日志就退出，不会去弹豆包窗口抢焦点。
+    这是个**独立任务**，不动主任务的触发器/动作。
 
   退出码：0 成功 / 1 找不到 pythonw / 2 注册失败
 #>
@@ -25,6 +33,8 @@ param(
     [string]$TaskName = 'WorkBuddyAutoSignin',
     [string]$Pythonw  = '',
     [string]$Time     = '00:05',
+    [string]$RetryTime = '12:30',
+    [switch]$NoRetry,
     [switch]$DryRun
 )
 
@@ -56,10 +66,14 @@ if (-not $Pythonw -or -not (Test-Path $Pythonw)) {
 }
 
 $arg = '"{0}" run all --json --log "{1}"' -f $hub, $log
+$rarg = '"{0}" retry --json --log "{1}"' -f $hub, $log
 Write-Host "task    : $TaskName"
 Write-Host "pythonw : $Pythonw"
 Write-Host "args    : $arg"
 Write-Host "workdir : $root"
+if (-not $NoRetry) {
+    Write-Host "retry   : $TaskName`Retry @ $RetryTime  →  $rarg"
+}
 
 if ($DryRun) { Write-Host "(dry-run, nothing changed)"; exit 0 }
 
@@ -80,12 +94,42 @@ try {
         Write-Host "[OK] created new task (daily at $Time)" -ForegroundColor Green
     }
 
+    # ---- 按需补跑任务（独立任务，失败不影响主任务）----
+    if (-not $NoRetry) {
+        $rname = "$TaskName`Retry"
+        try {
+            $rat  = [datetime]::ParseExact($RetryTime, 'HH:mm', $null)
+            $ract = New-ScheduledTaskAction -Execute $Pythonw -Argument $rarg -WorkingDirectory $root
+            $rtrg = New-ScheduledTaskTrigger -Daily -At $rat
+            $rset = New-ScheduledTaskSettingsSet -ExecutionTimeLimit (New-TimeSpan -Minutes 20) `
+                                                -StartWhenAvailable -MultipleInstances IgnoreNew
+            $rex = Get-ScheduledTask -TaskName $rname -ErrorAction SilentlyContinue
+            if ($rex) {
+                Set-ScheduledTask -TaskName $rname -Action $ract -Trigger $rtrg -Settings $rset | Out-Null
+                Write-Host "[OK] updated retry task ($rname @ $RetryTime)" -ForegroundColor Green
+            } else {
+                Register-ScheduledTask -TaskName $rname -Action $ract -Trigger $rtrg -Settings $rset | Out-Null
+                Write-Host "[OK] created retry task ($rname @ $RetryTime)" -ForegroundColor Green
+            }
+        }
+        catch {
+            # ★ 补跑任务建不成就降级说明，**不能**把主任务的结果一起判死
+            Write-Host "[!] retry task NOT installed: $($_.Exception.Message)" -ForegroundColor Yellow
+            Write-Host "    (主任务不受影响；可稍后用管理员身份重跑本脚本)" -ForegroundColor Yellow
+        }
+    }
+
     $t = Get-ScheduledTask -TaskName $TaskName
     Write-Host ""
     Write-Host "action  : $($t.Actions[0].Execute) $($t.Actions[0].Arguments)"
     Write-Host "workdir : $($t.Actions[0].WorkingDirectory)"
     Write-Host "limit   : $($t.Settings.ExecutionTimeLimit)"
     Write-Host "trigger : $(($t.Triggers | ForEach-Object { $_.StartBoundary }) -join '; ')"
+    $rt = Get-ScheduledTask -TaskName "$TaskName`Retry" -ErrorAction SilentlyContinue
+    if ($rt) {
+        Write-Host "retry   : $($rt.Actions[0].Arguments)"
+        Write-Host "rtrigger: $(($rt.Triggers | ForEach-Object { $_.StartBoundary }) -join '; ')"
+    }
     Write-Host ""
     Write-Host "verify  : Start-ScheduledTask -TaskName $TaskName ; then tail '$log'" -ForegroundColor Cyan
     exit 0

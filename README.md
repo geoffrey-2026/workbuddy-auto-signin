@@ -100,6 +100,7 @@ py signin_hub.py run doubao           # 只跑一个
 py signin_hub.py run all --dry-run    # 只看状态，不点、不领
 py signin_hub.py run all --skip doubao
 py signin_hub.py run all --json --log logs/hub.log   # 给自动化/无窗口运行用
+py signin_hub.py retry                # ★ 按需补跑：今天确有「没成」的站点才真跑
 py signin_hub.py doctor               # 离线体检（不联网、不启动外部程序）
 ```
 
@@ -161,7 +162,28 @@ py signin_hub.py doctor               # 离线体检（不联网、不启动外�
 | 任务名 | 触发 | 命令 |
 |---|---|---|
 | `WorkBuddyAutoSignin` | 每天 00:05 | `pythonw.exe signin_hub.py run all --json --log logs\hub.log` |
+| `WorkBuddyAutoSigninRetry` | 每天 12:30 | `pythonw.exe signin_hub.py retry --json --log logs\hub.log` |
 | `WorkBuddyGrowthPoll` | 每天 01/05/09/13/17/21 | `pythonw.exe signin.py silent-poll`（成长中心轮询，不变） |
+
+**为什么有第二条（按需补跑）**：主任务每天只有 00:05 一次机会。2026-11-16 那天豆包
+因为「页面还停在骨架屏」判了失败，而人白天不会去翻 `hub.log` ⇒ 那 200 额度白丢一天。
+`retry` 只在**今天确有 `failed`** 时才真跑；全成时只读一行日志就退出（`retry_skipped`），
+不会去弹豆包窗口抢焦点。`error`（未登录/缺依赖）不补跑——那得人先介入。
+
+两个任务都是 `install-hub-task.ps1` 装的（幂等，可反复跑；`-NoRetry` 可不要补跑）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-hub-task.ps1
+```
+
+> [!TIP]
+> **豆包这个站点的等待口径**：页面是重型 SPA，`domcontentloaded` 之后还要再等
+> 一两秒才结束骨架屏（实测正常 1.5~2.8 秒，冷启动更久）。
+> 所以 `sites/doubao.py` **不用固定 sleep**，而是轮询等「每日签到」卡片出现
+> （默认 25 秒预算，`DOUBAO_CARD_WAIT` 可调），没出来再整页重载一次。
+> 卡片没出来时归因分三档 —— 未登录 / **还在加载（正文 < 60 字）** / 真没这张卡
+> （活动改版）。分不清这三档，排错就会往错的方向走。
+> 只想量化「卡片到底几秒出来」：`py _probe_doubao_card.py 40`（只读，不点击）。
 
 ★ 用 `pythonw.exe` 跑时 `sys.stdout` 是 `None`，所以 **`--log` 不是可选项**：
 结果只有落在 `logs/hub.log` 里，第二天才查得出来昨天到底领没领。

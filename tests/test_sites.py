@@ -206,6 +206,229 @@ class TestDoubaoModule(unittest.TestCase):
                 os.environ["DOUBAO_CLAIM_LOG_DIR"] = old
 
 
+class _StubPage(object):
+    """假页面：只实现 ``_wait_card`` / 归因函数用到的那几个方法（不连网、不真睡）。
+
+    ``*_from_round`` 的语义：第 N 轮（0 起）之后，该探针才开始「有值」，
+    用来复现「页面慢慢渲染」与「一直停在骨架屏」。
+    """
+
+    def __init__(self, card_from_round=None, textlen=0, textlen_from_round=None,
+                 logged_out_from_round=None):
+        self.round = 0
+        self.card_from_round = card_from_round
+        self.textlen = textlen
+        self.textlen_from_round = textlen_from_round
+        self.logged_out_from_round = logged_out_from_round
+        self.slept = 0
+        self.probes = []
+
+    def evaluate(self, js):
+        self.probes.append(js)
+        if js == doubao.JS_CARD:
+            if self.card_from_round is not None and self.round >= self.card_from_round:
+                return {"found": True, "claimed": False,
+                        "cardText": "每日签到 +400 额度 立即签到",
+                        "clickables": [{"t": "立即签到", "x": 704, "y": 429,
+                                        "w": 80, "h": 32}]}
+            return {"found": False}
+        if js == doubao.JS_TEXTLEN:
+            if (self.textlen_from_round is not None
+                    and self.round >= self.textlen_from_round):
+                return self.textlen
+            return 0
+        if js == doubao.JS_LOGGED_OUT:
+            return bool(self.logged_out_from_round is not None
+                        and self.round >= self.logged_out_from_round)
+        raise AssertionError("意外的探针：%r" % (js,))
+
+    def wait_for_timeout(self, ms):
+        self.slept += 1
+        self.round += 1
+
+
+class TestDoubaoCardWait(unittest.TestCase):
+    """★ 2026-11-16 血案：固定等 3.5s 时页面还是骨架屏，却被报成「活动改版或下线」。
+
+    这一组测的就是「等得够 + 归因对」。它们全是离线纯逻辑，不需要豆包、不需要 playwright。
+    """
+
+    def test_polls_until_card_renders_instead_of_fixed_sleep(self):
+        # 第 3 轮才渲染出来 ⇒ 必须一直等到它出现，而不是查一次就判死
+        page = _StubPage(card_from_round=3, textlen=1400, textlen_from_round=2)
+        card, info = doubao._wait_card(page, budget=20.0, step=0.5)
+        self.assertTrue(card["found"])
+        self.assertGreaterEqual(info["samples"], 4)
+        self.assertEqual(page.slept, 3)
+
+    def test_found_immediately_costs_no_sleep(self):
+        page = _StubPage(card_from_round=0, textlen=1327)
+        card, info = doubao._wait_card(page, budget=20.0, step=0.5)
+        self.assertTrue(card["found"])
+        self.assertEqual(page.slept, 0)
+        self.assertEqual(info["samples"], 1)
+
+    def test_gives_up_after_budget_and_reports_zero_text(self):
+        # ★ 关键：一直骨架屏时，正文长度必须如实带出来（0 字）——归因全靠它
+        page = _StubPage(card_from_round=None)
+        card, info = doubao._wait_card(page, budget=3.0, step=0.5)
+        self.assertFalse(card["found"])
+        self.assertEqual(info["textlen"], 0)
+        # 采样次数受「采样上限」约束，不会无限转
+        self.assertLessEqual(info["samples"], int(3.0 / 0.5) + 2)
+
+    def test_stops_early_when_logged_out(self):
+        # 未登录就别干等 25 秒
+        page = _StubPage(card_from_round=None, logged_out_from_round=1)
+        card, info = doubao._wait_card(page, budget=20.0, step=0.5)
+        self.assertFalse(card["found"])
+        self.assertTrue(info["logged_out"])
+        self.assertLessEqual(info["samples"], 3)
+
+    def test_env_override_budget(self):
+        old = os.environ.get("DOUBAO_CARD_WAIT")
+        try:
+            os.environ["DOUBAO_CARD_WAIT"] = "60"
+            self.assertEqual(doubao._card_budget(), 60.0)
+            os.environ["DOUBAO_CARD_WAIT"] = "999"      # 上限夹住
+            self.assertEqual(doubao._card_budget(), 180.0)
+            os.environ["DOUBAO_CARD_WAIT"] = "垃圾"
+            self.assertEqual(doubao._card_budget(), doubao.CARD_WAIT)
+        finally:
+            if old is None:
+                os.environ.pop("DOUBAO_CARD_WAIT", None)
+            else:
+                os.environ["DOUBAO_CARD_WAIT"] = old
+
+
+class TestDoubaoMissingCardReason(unittest.TestCase):
+    """卡片没出来时必须分三档归因：未登录 / 还在加载 / 真没这张卡。"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="doubao-reason-")
+        self.old = os.environ.get("DOUBAO_CLAIM_LOG_DIR")
+        os.environ["DOUBAO_CLAIM_LOG_DIR"] = self.tmp
+
+    def tearDown(self):
+        import shutil
+        if self.old is None:
+            os.environ.pop("DOUBAO_CLAIM_LOG_DIR", None)
+        else:
+            os.environ["DOUBAO_CLAIM_LOG_DIR"] = self.old
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _read_log(self):
+        p = os.path.join(self.tmp, "claim-log.tsv")
+        if not os.path.exists(p):
+            return ""
+        with open(p, encoding="utf-8") as f:
+            return f.read()
+
+    def test_skeleton_is_not_reported_as_site_redesign(self):
+        # ★ 这条就是血案本体：正文 0 字 ⇒ 必须说「没渲染完」，不许说「活动改版」
+        r = doubao._login_or_card_missing(
+            _StubPage(), {"waited": 12.5, "textlen": 0, "logged_out": False},
+            os.path.join(self.tmp, "x.png"), [], False, "first")
+        self.assertEqual(r["state"], base.FAILED)
+        self.assertIn("没渲染完", r["report"])
+        self.assertNotIn("改版", r["report"])
+        self.assertIn("page-not-rendered", self._read_log())
+
+    def test_rendered_page_without_card_is_redesign(self):
+        r = doubao._login_or_card_missing(
+            _StubPage(), {"waited": 25.0, "textlen": 1400, "logged_out": False},
+            os.path.join(self.tmp, "x.png"), [], False, "after-reload")
+        self.assertEqual(r["state"], base.FAILED)
+        self.assertIn("找不到「每日签到」卡片", r["report"])
+        self.assertIn("card-not-found", self._read_log())
+
+    def test_logged_out_wins_over_everything(self):
+        r = doubao._login_or_card_missing(
+            _StubPage(), {"waited": 1.0, "textlen": 0, "logged_out": True},
+            os.path.join(self.tmp, "x.png"), [], False, "first")
+        self.assertEqual(r["state"], base.ERROR)
+        self.assertEqual(r["exit"], doubao.EXIT_LOGIN)
+        self.assertIn("not-logged-in", self._read_log())
+
+
+class TestRetryDecision(unittest.TestCase):
+    """按需补跑：只在「今天确有 failed」时才真跑，正常日子不许去弹豆包窗口。"""
+
+    def _payload(self, states, when=None):
+        return {"when": when or "2026-11-16 00:05:12",
+                "sites": [{"site": "doubao", "ok": s in (base.CLAIMED, base.ALREADY,
+                                                          base.SKIPPED),
+                           "state": s, "report": "x"} for s in states]}
+
+    def test_all_good_does_not_retry(self):
+        # ★ 这条最要紧：全成时补跑若还去开豆包，等于每天白天抢一次焦点
+        need, why = signin_hub.should_retry(self._payload([base.CLAIMED, base.ALREADY]))
+        self.assertFalse(need)
+        self.assertIn("全部完成", why)
+
+    def test_failed_triggers_retry(self):
+        need, why = signin_hub.should_retry(
+            self._payload([base.CLAIMED, base.FAILED]))
+        self.assertTrue(need)
+        self.assertIn("没成", why)
+
+    def test_error_alone_does_not_retry(self):
+        # 未登录 / 缺依赖属于「人得先介入」，补跑只会再失败一次、还多弹一次窗
+        need, why = signin_hub.should_retry(self._payload([base.ERROR]))
+        self.assertFalse(need)
+        self.assertIn("人工处理", why)
+
+    def test_no_record_means_retry(self):
+        need, why = signin_hub.should_retry(None)
+        self.assertTrue(need)
+        self.assertIn("没有", why)
+
+    def test_last_run_of_day_picks_last_and_ignores_other_days(self):
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="hublog-")
+        p = os.path.join(tmp, "hub.log")
+        lines = [
+            '[2026-11-15 00:05:14] {"when": "2026-11-15 00:05:14", "sites": []}',
+            '[2026-11-16 00:05:12] {"when": "2026-11-16 00:05:12", "sites": [{"site":"d","ok":false,"state":"failed","report":"r1"}]}',
+            '[2026-11-16 12:30:00] {"when": "2026-11-16 12:30:00", "sites": [{"site":"d","ok":true,"state":"claimed","report":"r2"}]}',
+            '这是坏行，不该让解析崩',
+        ]
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write("\n".join(lines) + "\n")
+        last = signin_hub.last_run_of_day(p, day="2026-11-16")
+        self.assertEqual(last["when"], "2026-11-16 12:30:00")
+        self.assertTrue(last["sites"][0]["ok"])
+        # 当天的记录被补跑修正后，就不该再补
+        self.assertFalse(signin_hub.should_retry(last)[0])
+        # 没有文件、没有当天记录都要能安全返回 None
+        self.assertIsNone(signin_hub.last_run_of_day(os.path.join(tmp, "nope.log")))
+        self.assertIsNone(signin_hub.last_run_of_day(p, day="1999-01-01"))
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_retry_skips_without_touching_network(self):
+        """补跑命令在「今天全成」时必须是纯读日志、不跑任何站点。"""
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="hubretry-")
+        p = os.path.join(tmp, "hub.log")
+        with open(p, "w", encoding="utf-8", newline="\n") as f:
+            f.write('[2026-11-16 00:05:12] {"when": "%s 00:05:12", '
+                    '"sites": [{"site":"d","ok":true,"state":"claimed","report":"ok"}]}\n'
+                    % __import__("datetime").date.today().isoformat())
+        called = []
+        real = signin_hub.cmd_run
+        signin_hub.cmd_run = lambda a: called.append(1) or 0
+        try:
+            rc = signin_hub.main(["retry", "--json", "--log", p])
+        finally:
+            signin_hub.cmd_run = real
+            import shutil
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(called, [], "全成时不许真的去跑站点")
+
+
 class TestHubCli(unittest.TestCase):
     def test_split(self):
         self.assertEqual(signin_hub._split("a, b ,,c"), ["a", "b", "c"])

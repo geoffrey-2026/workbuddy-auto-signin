@@ -20,6 +20,13 @@
 签到卡片内存在 class 含 ``rewarded`` 的元素（实测 ``rewarded-nPpEuG``，就是那个 ✓）
 ⇒ 今日已签。未签到时该位置是一个按钮。
 
+★ 等页面的口径（2026-11-16 血案后改）
+  原来是 ``wait_for_timeout(3500)`` 后只查一次卡片。00:05 那轮机器刚从睡眠醒、
+  冷缓存，3.5 秒时页面还停在**骨架屏**（正文 0 字），于是被判成
+  「页面上找不到「每日签到」卡片 / 活动可能改版或下线」—— 判据自己说错话。
+  现在改为 ``_wait_card()`` 轮询（默认 25 秒预算，``DOUBAO_CARD_WAIT`` 可覆盖），
+  没出来就整页重载一次再等；归因分三档：未登录 / 还在加载（正文 < 60 字）/ 真没这张卡。
+
 ★ 迁移说明（2026-11-13，workbuddy-main）
   本模块的逻辑整体迁自
   ``ImmuneWarPro/tools/美术生成/doubao_daily_claim.py``（免疫战争窗口所写，已实跑多日）。
@@ -59,6 +66,16 @@ EXIT_PAGE = 3        # 签到页打不开
 EXIT_CARD = 4        # 找不到「每日签到」卡片 / 没有可点控件
 EXIT_NOCHANGE = 5    # 点了但额度没涨（可能被风控 / 活动下线）
 EXIT_LOGIN = 6       # 未登录
+
+# 等「每日签到」卡片渲染出来的预算（秒）
+#   ★ 2026-11-16 实测：正常情况卡片 2.8s 出现（第 1.8s 仍是骨架屏、正文 0 字）；
+#     00:05 那轮机器刚从睡眠醒、冷缓存，固定 3.5s 明显不够 ⇒ 改成轮询 + 一次重载。
+#   ★ 可用 DOUBAO_CARD_WAIT 覆盖（慢机器 / 慢网络）。
+CARD_WAIT = 25.0
+
+# 正文少于这么多字 ⇒ 认定「还停在骨架屏」，不能据此判成「活动改版」
+#   实测：骨架屏 0 字；渲染完成 1300+ 字。
+SKELETON_TEXTLEN = 60
 
 # ---------- 页面内探针 ----------
 
@@ -140,6 +157,14 @@ JS_CARD = r"""
     clickables,
   };
 }
+"""
+
+
+# 3.5) 页面正文长度 —— 用来区分「还停在骨架屏」和「加载完了但没这张卡」
+#      ★ 2026-11-16 血案：00:05 那次固定等 3.5s 后页面还是骨架屏（正文 0 字），
+#        卡片当然找不到，却被判成「活动可能改版或下线」。判据说错话，人就会去查错方向。
+JS_TEXTLEN = r"""
+() => (document.body.innerText || '').length
 """
 
 
@@ -249,6 +274,93 @@ def _playwright():
                            "&& playwright install chromium" % (e,))
 
 
+def _card_budget():
+    """等卡片的预算秒数（``DOUBAO_CARD_WAIT`` 可覆盖）。"""
+    try:
+        v = float((os.environ.get("DOUBAO_CARD_WAIT") or "").strip() or CARD_WAIT)
+        return max(3.0, min(180.0, v))
+    except Exception:
+        return CARD_WAIT
+
+
+def _wait_card(page, budget=None, step=0.5):
+    """轮询等「每日签到」卡片出现，而不是固定 sleep 一个数字。
+
+    返回 ``(card, info)``：
+      ``card`` 最后一次 ``JS_CARD`` 的结果（``found`` 可能为 False）；
+      ``info`` 诊断：``waited`` / ``textlen`` / ``logged_out`` / ``samples``。
+
+    ★ 为什么改成轮询（2026-11-16 血案）
+      原来是 ``wait_for_timeout(3500)`` 后只调一次 ``JS_CARD``。00:05 那轮页面
+      还在骨架屏（正文 0 字），卡片必然找不到，结果被报成
+      「页面上找不到「每日签到」卡片 / 活动可能改版或下线」——
+      **判据自己说错话**，人照着这个提示只会去查活动页，永远查不到真因。
+      现在：等够预算再判，并且把「正文长度」一起带出来，能区分
+      「没加载完」与「加载完了但真没这张卡」。
+    """
+    budget = _card_budget() if budget is None else float(budget)
+    t0 = time.time()
+    card = {"found": False}
+    info = {"waited": 0.0, "textlen": 0, "logged_out": False, "samples": 0}
+    while True:
+        card = page.evaluate(JS_CARD) or {"found": False}
+        info["samples"] += 1
+        try:
+            info["textlen"] = int(page.evaluate(JS_TEXTLEN) or 0)
+        except Exception:
+            info["textlen"] = -1
+        if card.get("found"):
+            break
+        try:
+            info["logged_out"] = bool(page.evaluate(JS_LOGGED_OUT))
+        except Exception:
+            info["logged_out"] = False
+        info["waited"] = time.time() - t0
+        # 未登录就别干等；预算用完也停。
+        # ★ 两个上限都要有：按**采样次数**算的那个是确定性的（可在离线测试里
+        #   用不真睡的假页面复现），按**挂钟**算的那个防真实环境里某次 evaluate 卡住。
+        if (info["logged_out"] or info["waited"] >= budget
+                or info["samples"] * step >= budget):
+            break
+        page.wait_for_timeout(int(step * 1000))
+    info["waited"] = round(time.time() - t0, 2)
+    return card, info
+
+
+def _login_or_card_missing(page, info, shot_path, ev, shot, stage):
+    """卡片没出来时的归因：未登录 / 还在加载 / 真没这张卡。
+
+    ★ 这三种情况的处置完全不同：未登录要人去登、没加载完该加预算或重试、
+      真没这张卡才是「活动改版」。混成一句话，排错就会走错方向。
+    """
+    if shot:
+        _safe_shot(page, shot_path, ev)
+    if info.get("logged_out"):
+        path = _log(None, False, "not-logged-in", "stage=%s" % stage)
+        return base.make_result(SITE, base.ERROR, "豆包未登录",
+                                detail="页面出现「登录」按钮 ⇒ 先在豆包里登录一次",
+                                evidence=ev + [path], exit_code=EXIT_LOGIN)
+    if (info.get("textlen") or 0) < SKELETON_TEXTLEN:
+        path = _log(None, False, "page-not-rendered",
+                    "stage=%s waited=%.1fs textlen=%s"
+                    % (stage, info.get("waited") or 0, info.get("textlen")))
+        return base.make_result(
+            SITE, base.FAILED,
+            "签到页 %d 秒内没渲染完（停在骨架屏）" % int(info.get("waited") or 0),
+            detail="正文只有 %s 字，卡片区还是灰色占位 ⇒ 不是活动改版，是加载太慢。\n"
+                   "可用 DOUBAO_CARD_WAIT 放大等待预算；先看截图。"
+                   % (info.get("textlen"),),
+            evidence=ev + [path], exit_code=EXIT_CARD)
+    path = _log(None, False, "card-not-found",
+                "stage=%s waited=%.1fs textlen=%s"
+                % (stage, info.get("waited") or 0, info.get("textlen")))
+    return base.make_result(SITE, base.FAILED, "页面上找不到「每日签到」卡片",
+                            detail="页面正文 %s 字、已渲染完，但确实没有这张卡 ⇒ "
+                                   "活动可能改版或下线；先看截图再判断，不要盲目重试。"
+                                   % (info.get("textlen"),),
+                            evidence=ev + [path], exit_code=EXIT_CARD)
+
+
 # ---------- 主流程 ----------
 
 def run(dry_run=False, force=False, shot=True, cdp=None, launch=True, **_kw):
@@ -336,26 +448,31 @@ def _claim(sync_playwright, cdp, out, dry_run, force, shot):
                 return base.make_result(SITE, base.FAILED, "签到页打不开",
                                         detail=repr(e), evidence=ev + [path],
                                         exit_code=EXIT_PAGE)
-            page.wait_for_timeout(3500)
-
-            if page.evaluate(JS_LOGGED_OUT):
-                if shot:
-                    _safe_shot(page, shot_path, ev)
-                path = _log(None, False, "not-logged-in")
-                return base.make_result(SITE, base.ERROR, "豆包未登录",
-                                        detail="页面出现「登录」按钮 ⇒ 先在豆包里登录一次",
-                                        evidence=ev + [path], exit_code=EXIT_LOGIN)
+            # ★ 轮询等卡片，不用固定 sleep（见 _wait_card 的说明）
+            card, info = _wait_card(page)
+            if not card.get("found"):
+                if info.get("logged_out"):
+                    return _login_or_card_missing(page, info, shot_path, ev, shot,
+                                                  "first")
+                # 二次机会：整页重载一次。首次加载偶发卡在骨架屏 / 某个 XHR 挂了，
+                # 重载一次通常就好；★ 每天只有这一枪，不能因为一次抖动就空一天。
+                print("· 卡片没出来（%.1fs，正文 %s 字），重载一次再等"
+                      % (info.get("waited") or 0, info.get("textlen")))
+                try:
+                    page.reload(wait_until="domcontentloaded", timeout=30000)
+                except Exception as e:
+                    print("· 重载失败：%r" % (e,))
+                card, info2 = _wait_card(page)
+                if not card.get("found"):
+                    info2["waited"] = round((info.get("waited") or 0)
+                                            + (info2.get("waited") or 0), 2)
+                    return _login_or_card_missing(page, info2, shot_path, ev, shot,
+                                                  "after-reload")
 
             acc0 = page.evaluate(JS_ACC)
-            card = page.evaluate(JS_CARD)
-            if not card.get("found"):
-                if shot:
-                    _safe_shot(page, shot_path, ev)
-                path = _log(acc0, False, "card-not-found")
-                return base.make_result(SITE, base.FAILED, "页面上找不到「每日签到」卡片",
-                                        detail="活动可能改版或下线；先看截图再判断，不要盲目重试",
-                                        evidence=ev + [path], exit_code=EXIT_CARD)
 
+            print("· 卡片 %.1fs 后出现（正文 %s 字）" % (info.get("waited") or 0,
+                                                     info.get("textlen")))
             print("· 累计额度 %s ｜ 今日已签：%s" % (acc0, "是" if card["claimed"] else "否"))
             print("· 卡片：%s" % str(card.get("cardText") or "")[:60])
 
@@ -452,6 +569,8 @@ def doctor():
         "doubao_exe_exists": os.path.exists(DOUBAO_EXE),
         "cdp": os.environ.get("DOUBAO_CDP") or CDP_DEFAULT,
         "cdp_alive": _cdp_alive(os.environ.get("DOUBAO_CDP") or CDP_DEFAULT),
+        "card_wait": _card_budget(),
+        "skeleton_textlen": SKELETON_TEXTLEN,
         "out_dir": out_dir(),
     }
     try:
