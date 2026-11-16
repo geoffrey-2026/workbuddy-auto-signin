@@ -15,16 +15,18 @@ from __future__ import annotations
 
 from . import base
 from . import doubao
+from . import doubao_extra
 from . import workbuddy
 
 # 站点 id → 模块（模块自带 SITE / TITLE / NEEDS）
 _REGISTRY = {
     "workbuddy": workbuddy,
     "doubao": doubao,
+    "doubao-extra": doubao_extra,
 }
 
 # `run all` 的执行顺序（★ 与注册顺序分开：注册顺序是给人读的，执行顺序是按代价排的）
-ORDER = ["workbuddy", "doubao"]
+ORDER = ["workbuddy", "doubao", "doubao-extra"]
 
 
 def names():

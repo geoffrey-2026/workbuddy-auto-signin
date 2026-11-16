@@ -18,7 +18,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import signin_hub
 import sites
-from sites import base, doubao, workbuddy
+from sites import base, doubao, doubao_extra, workbuddy
 
 
 class TestResultContract(unittest.TestCase):
@@ -427,6 +427,50 @@ class TestRetryDecision(unittest.TestCase):
             shutil.rmtree(tmp, ignore_errors=True)
         self.assertEqual(rc, 0)
         self.assertEqual(called, [], "全成时不许真的去跑站点")
+
+
+class TestDoubaoExtraSafety(unittest.TestCase):
+    """★★ 「只领不造」的代码级护栏（2026-11-16 冰哥拍板）。
+
+    这个模块会去点网页上的按钮。一旦判错，它就会代替人去「完成任务」骗取额度 ——
+    那是伪造使用行为。所以「哪些文字算领取」必须是一条能被测试钉死的白名单。
+    """
+
+    def test_only_claim_texts_are_allowed(self):
+        # ★ 「领奖励」是实测出来的真文案（点完选择工作领域+确定之后出现）
+        for t in ("领取", "立即领取", "领奖励", "领取奖励"):
+            self.assertTrue(doubao_extra.is_claim_text(t), t)
+
+    def test_go_finish_is_never_a_claim(self):
+        # ★ 核心负对照：这几张卡上现在挂的全是「去完成」，一个都不许点
+        for t in ("去完成", "去完成 ", "立即签到", "去签到", "签到"):
+            self.assertFalse(doubao_extra.is_claim_text(t), t)
+
+    def test_unknown_button_text_fails_closed(self):
+        # 认不出来的文字一律不点（页面改版时宁可少领，也不能乱点）
+        for t in ("", None, "领取记录", "查看", "确认", "领取额度说明"):
+            self.assertFalse(doubao_extra.is_claim_text(t), repr(t))
+
+    def test_milestone_disabled_attribute_is_the_judge(self):
+        self.assertTrue(doubao_extra.milestone_claimable("false"))
+        self.assertTrue(doubao_extra.milestone_claimable("FALSE"))
+        self.assertFalse(doubao_extra.milestone_claimable("true"))
+        # fail closed：属性缺失/空串都不许点
+        self.assertFalse(doubao_extra.milestone_claimable(""))
+        self.assertFalse(doubao_extra.milestone_claimable(None))
+
+    def test_registered_and_ordered_after_doubao(self):
+        self.assertIn("doubao-extra", sites.names())
+        o = sites.ORDER
+        self.assertLess(o.index("doubao"), o.index("doubao-extra"))
+        self.assertEqual(doubao_extra.SITE, "doubao-extra")
+
+    def test_probes_exist(self):
+        for name in ("JS_MARK_MILESTONES", "JS_MARK_TASK_CLAIMS"):
+            js = getattr(doubao_extra, name)
+            self.assertIn("return", js, name)
+        # 任务卡探针必须按白名单参数过滤，不能把「去完成」也标出来
+        self.assertIn("allow", doubao_extra.JS_MARK_TASK_CLAIMS)
 
 
 class TestHubCli(unittest.TestCase):
